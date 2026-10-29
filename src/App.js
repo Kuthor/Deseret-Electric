@@ -200,6 +200,22 @@ const stripReceiptPhoto = (r) => (r.photoUrl ? { ...r, photo: null } : r);
 const cleanJobs = (jobs) => jobs.map(j => ({ ...j, receipts: (j.receipts || []).map(stripReceiptPhoto) }));
 const cleanLogs = (logs) => logs.map(stripReceiptPhoto);
 
+// Collapse duplicate log entries: copies of the same id (last copy wins), then
+// entries that are identical apart from their id (e.g. from a double-tapped Save).
+const logKey = (l) => [l.jobId, String(l.date || "").slice(0, 10), l.crew, l.hours, l.hourlyRate, l.notes, l.photoUrl]
+  .map(v => String(v ?? "")).join("|");
+function dedupeLogs(logs) {
+  const byId = new Map();
+  for (const l of logs) byId.set(l.id ? String(l.id) : Symbol(), l);
+  const seen = new Set();
+  return [...byId.values()].filter(l => {
+    const key = logKey(l);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 async function fetchServer() {
   const res = await fetch(SHEETS_URL + "?t=" + Date.now());
   if (!res.ok) throw new Error("HTTP " + res.status);
@@ -268,8 +284,9 @@ function applyOp(state, op) {
 
 // ─── RECEIPT FORM ─────────────────────────────────────────────────────────────
 function ReceiptForm({ receipt, onSave, onClose, sheetsUrl }) {
+  // id is fixed when the form opens so a repeated Save updates the same receipt
   const [form, setForm] = useState(receipt || {
-    vendor: "", amount: "", category: "Materials", date: new Date().toISOString().split("T")[0],
+    id: generateId(), vendor: "", amount: "", category: "Materials", date: new Date().toISOString().split("T")[0],
     description: "", photo: null, photoUrl: null
   });
   const [uploading, setUploading] = useState(false);
@@ -367,8 +384,9 @@ function ReceiptForm({ receipt, onSave, onClose, sheetsUrl }) {
 
 // ─── LOG FORM ──────────────────────────────────────────────────────────────────
 function LogForm({ log, jobs, onSave, onClose, sheetsUrl }) {
+  // id is fixed when the form opens so a repeated Save updates the same entry
   const [form, setForm] = useState(log || {
-    jobId: jobs[0]?.id || "", date: new Date().toISOString().split("T")[0],
+    id: generateId(), jobId: jobs[0]?.id || "", date: new Date().toISOString().split("T")[0],
     crew: "1", hours: "", hourlyRate: "60", notes: "", photo: null, photoUrl: null
   });
   const [uploading, setUploading] = useState(false);
@@ -511,11 +529,13 @@ export default function ContractorTracker() {
       setSyncing(true);
       try {
         const server = await fetchServer();
-        let state = { jobs: server.jobs, logs: server.logs ?? stateRef.current.logs };
+        const serverLogs = server.logs && dedupeLogs(server.logs);
+        const hadDuplicateLogs = !!serverLogs && serverLogs.length < server.logs.length;
+        let state = { jobs: server.jobs, logs: serverLogs ?? stateRef.current.logs };
         for (const op of pending) state = applyOp(state, op);
 
         if (pending.some(op => !op.type.endsWith("Log"))) await postAction("saveJobs", cleanJobs(state.jobs));
-        if (pending.some(op => op.type.endsWith("Log"))) await postAction("saveLogs", cleanLogs(state.logs));
+        if (hadDuplicateLogs || pending.some(op => op.type.endsWith("Log"))) await postAction("saveLogs", cleanLogs(state.logs));
 
         // Only clear the changes we just saved; new ones may have been added meanwhile
         const remaining = readLocal(PENDING_KEY, []).slice(pending.length);
@@ -550,7 +570,7 @@ export default function ContractorTracker() {
   // Load: show the copy saved on this device instantly, then refresh from
   // Google Sheets. Refresh again whenever the app is reopened or comes back online.
   useEffect(() => {
-    let cached = { jobs: readLocal(STORAGE_KEY, []), logs: readLocal(STORAGE_KEY + "-logs", []) };
+    let cached = { jobs: readLocal(STORAGE_KEY, []), logs: dedupeLogs(readLocal(STORAGE_KEY + "-logs", [])) };
     for (const op of readLocal(PENDING_KEY, [])) cached = applyOp(cached, op);
     stateRef.current = cached;
     setJobs(cached.jobs);

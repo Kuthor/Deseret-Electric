@@ -423,11 +423,14 @@ export default function ContractorTracker() {
     setSyncing(true);
     setSyncStatus(null);
     try {
+      // Send the stripped copy — base64 photos blow past the Sheets cell limit; photoUrl (Drive) is the synced copy
       const form = new FormData();
       form.append("action", "saveJobs");
-      form.append("payload", JSON.stringify(updated));
+      form.append("payload", JSON.stringify(stripped));
       const res = await fetch(SHEETS_URL, { method: "POST", body: form });
-      await res.json();
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const json = await res.json();
+      if (json && json.error) throw new Error(json.error);
       setSyncStatus("saved");
     } catch {
       setSyncStatus("error");
@@ -446,9 +449,11 @@ export default function ContractorTracker() {
     try {
       const form = new FormData();
       form.append("action", "saveLogs");
-      form.append("payload", JSON.stringify(updated));
+      form.append("payload", JSON.stringify(strippedLogs));
       const resLogs = await fetch(SHEETS_URL, { method: "POST", body: form });
-      await resLogs.json();
+      if (!resLogs.ok) throw new Error("HTTP " + resLogs.status);
+      const json = await resLogs.json();
+      if (json && json.error) throw new Error(json.error);
       setSyncStatus("saved");
     } catch {
       setSyncStatus("error");

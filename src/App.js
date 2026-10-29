@@ -165,6 +165,107 @@ function compressImage(dataUrl, maxWidth = 1200, quality = 0.7) {
   });
 }
 
+// ─── PHOTO UPLOAD ─────────────────────────────────────────────────────────────
+// Uploads a (compressed) data URL to Drive via the Apps Script. Returns the URL or throws.
+async function uploadPhoto(sheetsUrl, dataUrl, filename, folder) {
+  const fd = new FormData();
+  fd.append("action", "uploadPhoto");
+  fd.append("filename", filename);
+  fd.append("mimeType", "image/jpeg");
+  fd.append("data", dataUrl.split(",")[1]);
+  fd.append("folder", folder);
+  const res = await fetch(sheetsUrl, { method: "POST", body: fd });
+  const json = await res.json();
+  if (!json.url) throw new Error(json.error || "Upload failed");
+  return json.url;
+}
+
+// ─── SYNC HELPERS ─────────────────────────────────────────────────────────────
+// Every change is recorded as a small "operation" and replayed on top of the
+// latest data from Google Sheets right before saving. That way a save can never
+// overwrite receipts added from another device or by an earlier save that was
+// still in flight, and nothing is lost if the network drops.
+const PENDING_KEY = STORAGE_KEY + "-pending";
+
+const readLocal = (key, fallback) => {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; } catch { return fallback; }
+};
+const writeLocal = (key, value) => {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+};
+
+// Drop the in-browser photo copy once the photo is safely in Drive — those
+// data URLs are megabytes each and make the save to Sheets fail.
+const stripReceiptPhoto = (r) => (r.photoUrl ? { ...r, photo: null } : r);
+const cleanJobs = (jobs) => jobs.map(j => ({ ...j, receipts: (j.receipts || []).map(stripReceiptPhoto) }));
+const cleanLogs = (logs) => logs.map(stripReceiptPhoto);
+
+async function fetchServer() {
+  const res = await fetch(SHEETS_URL + "?t=" + Date.now());
+  if (!res.ok) throw new Error("HTTP " + res.status);
+  const text = await res.text();
+  // Check we got JSON not an HTML error page
+  if (text.trim().startsWith("<")) throw new Error("Got HTML instead of JSON");
+  const data = JSON.parse(text);
+  if (data && Array.isArray(data.jobs)) return { jobs: data.jobs, logs: Array.isArray(data.logs) ? data.logs : [] };
+  if (Array.isArray(data)) return { jobs: data, logs: null };
+  throw new Error("Unexpected response from Google Sheets");
+}
+
+async function postAction(action, payload) {
+  const form = new FormData();
+  form.append("action", action);
+  form.append("payload", JSON.stringify(payload));
+  const res = await fetch(SHEETS_URL, { method: "POST", body: form });
+  const json = await res.json();
+  if (json && (json.error || json.success === false || json.status === "error")) {
+    throw new Error(json.error || json.message || "Save failed");
+  }
+  return json;
+}
+
+function applyOp(state, op) {
+  let { jobs, logs } = state;
+  switch (op.type) {
+    case "upsertJob": {
+      const { receipts, ...fields } = op.job;
+      jobs = jobs.some(j => j.id === fields.id)
+        ? jobs.map(j => j.id === fields.id ? { ...j, ...fields } : j) // keep the latest receipts
+        : [...jobs, { ...fields, receipts: receipts || [] }];
+      break;
+    }
+    case "deleteJob":
+      jobs = jobs.filter(j => j.id !== op.id);
+      break;
+    case "upsertReceipt":
+      jobs = jobs.map(j => {
+        if (j.id !== op.jobId) return j;
+        const receipts = j.receipts || [];
+        return {
+          ...j,
+          receipts: receipts.some(r => r.id === op.receipt.id)
+            ? receipts.map(r => r.id === op.receipt.id ? op.receipt : r)
+            : [...receipts, op.receipt]
+        };
+      });
+      break;
+    case "deleteReceipt":
+      jobs = jobs.map(j => j.id !== op.jobId ? j : { ...j, receipts: (j.receipts || []).filter(r => r.id !== op.id) });
+      break;
+    case "upsertLog":
+      logs = logs.some(l => l.id === op.log.id)
+        ? logs.map(l => l.id === op.log.id ? op.log : l)
+        : [...logs, op.log];
+      break;
+    case "deleteLog":
+      logs = logs.filter(l => l.id !== op.id);
+      break;
+    default:
+      break;
+  }
+  return { jobs, logs };
+}
+
 // ─── RECEIPT FORM ─────────────────────────────────────────────────────────────
 function ReceiptForm({ receipt, onSave, onClose, sheetsUrl }) {
   const [form, setForm] = useState(receipt || {
@@ -180,24 +281,14 @@ function ReceiptForm({ receipt, onSave, onClose, sheetsUrl }) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = async (ev) => {
-      const dataUrl = ev.target.result;
-      set("photo", dataUrl);
       setUploading(true);
+      const compressed = await compressImage(ev.target.result);
+      setForm(f => ({ ...f, photo: compressed, photoUrl: null }));
       try {
-        const compressed = await compressImage(dataUrl);
-        const base64 = compressed.split(",")[1];
-        const filename = `receipt_${Date.now()}.jpg`;
-        const fd = new FormData();
-        fd.append("action", "uploadPhoto");
-        fd.append("filename", filename);
-        fd.append("mimeType", "image/jpeg");
-        fd.append("data", base64);
-        fd.append("folder", "Deseret Electric Receipts");
-        const res = await fetch(sheetsUrl, { method: "POST", body: fd });
-        const json = await res.json();
-        if (json.url) set("photoUrl", json.url);
+        const url = await uploadPhoto(sheetsUrl, compressed, `receipt_${Date.now()}.jpg`, "Deseret Electric Receipts");
+        set("photoUrl", url);
       } catch {
-        // Keep local photo as fallback
+        // Retried when the receipt is saved
       } finally {
         setUploading(false);
       }
@@ -205,10 +296,24 @@ function ReceiptForm({ receipt, onSave, onClose, sheetsUrl }) {
     reader.readAsDataURL(file);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!form.vendor.trim() || !form.amount) return alert("Vendor and amount are required");
     if (uploading) return alert("Please wait — photo is still uploading");
-    onSave({ ...form, id: form.id || generateId() });
+    let saved = { ...form, id: form.id || generateId() };
+    if (saved.photo && !saved.photoUrl) {
+      setUploading(true);
+      try {
+        saved.photoUrl = await uploadPhoto(sheetsUrl, saved.photo, `receipt_${Date.now()}.jpg`, "Deseret Electric Receipts");
+      } catch {
+        if (!window.confirm("The receipt photo couldn't be uploaded (check your signal). Save the receipt without the photo?")) {
+          setUploading(false);
+          return;
+        }
+        saved = { ...saved, photo: null };
+      }
+      setUploading(false);
+    }
+    onSave(saved);
     onClose();
   };
 
@@ -277,31 +382,36 @@ function LogForm({ log, jobs, onSave, onClose, sheetsUrl }) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = async (ev) => {
-      const dataUrl = ev.target.result;
-      set("photo", dataUrl);
       setUploading(true);
+      const compressed = await compressImage(ev.target.result);
+      setForm(f => ({ ...f, photo: compressed, photoUrl: null }));
       try {
-        const compressed = await compressImage(dataUrl);
-        const base64 = compressed.split(",")[1];
-        const fd = new FormData();
-        fd.append("action", "uploadPhoto");
-        fd.append("filename", `site_${Date.now()}.jpg`);
-        fd.append("mimeType", "image/jpeg");
-        fd.append("data", base64);
-        fd.append("folder", "Deseret Electric Site Photos");
-        const res = await fetch(sheetsUrl, { method: "POST", body: fd });
-        const json = await res.json();
-        if (json.url) set("photoUrl", json.url);
+        const url = await uploadPhoto(sheetsUrl, compressed, `site_${Date.now()}.jpg`, "Deseret Electric Site Photos");
+        set("photoUrl", url);
       } catch {} finally { setUploading(false); }
     };
     reader.readAsDataURL(file);
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!form.jobId) return alert("Please select a job");
     if (!form.hours) return alert("Hours worked is required");
     if (uploading) return alert("Please wait — photo is still uploading");
-    onSave({ ...form, id: form.id || generateId(), laborCost });
+    let saved = { ...form, id: form.id || generateId(), laborCost };
+    if (saved.photo && !saved.photoUrl) {
+      setUploading(true);
+      try {
+        saved.photoUrl = await uploadPhoto(sheetsUrl, saved.photo, `site_${Date.now()}.jpg`, "Deseret Electric Site Photos");
+      } catch {
+        if (!window.confirm("The site photo couldn't be uploaded (check your signal). Save the entry without the photo?")) {
+          setUploading(false);
+          return;
+        }
+        saved = { ...saved, photo: null };
+      }
+      setUploading(false);
+    }
+    onSave(saved);
     onClose();
   };
 
@@ -381,130 +491,98 @@ export default function ContractorTracker() {
   const [syncing, setSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState(null);
 
-  // Load from Google Sheets
-  useEffect(() => {
-    (async () => {
+  // Always-current copies of state for the async sync code
+  const stateRef = useRef({ jobs: [], logs: [] });
+  stateRef.current = { jobs, logs };
+  const syncChain = useRef(Promise.resolve());
+
+  const showState = (state) => {
+    setJobs(state.jobs);
+    setLogs(state.logs);
+    writeLocal(STORAGE_KEY, cleanJobs(state.jobs));
+    writeLocal(STORAGE_KEY + "-logs", cleanLogs(state.logs));
+  };
+
+  // Pull the latest data from Google Sheets, replay any changes that haven't
+  // been saved yet on top of it, and save. Runs one at a time, in order.
+  const sync = () => {
+    syncChain.current = syncChain.current.then(async () => {
+      const pending = readLocal(PENDING_KEY, []);
       setSyncing(true);
       try {
-        const res = await fetch(SHEETS_URL + "?t=" + Date.now());
-        if (!res.ok) throw new Error("HTTP " + res.status);
-        const text = await res.text();
-        // Check we got JSON not an HTML error page
-        if (text.trim().startsWith("<")) throw new Error("Got HTML instead of JSON");
-        const data = JSON.parse(text);
-        if (data && data.jobs && Array.isArray(data.jobs)) {
-          setJobs(data.jobs);
-          if (Array.isArray(data.logs) && data.logs.length > 0) {
-            setLogs(data.logs);
-          }
-        } else if (Array.isArray(data) && data.length > 0) {
-          setJobs(data);
-        }
+        const server = await fetchServer();
+        let state = { jobs: server.jobs, logs: server.logs ?? stateRef.current.logs };
+        for (const op of pending) state = applyOp(state, op);
+
+        if (pending.some(op => !op.type.endsWith("Log"))) await postAction("saveJobs", cleanJobs(state.jobs));
+        if (pending.some(op => op.type.endsWith("Log"))) await postAction("saveLogs", cleanLogs(state.logs));
+
+        // Only clear the changes we just saved; new ones may have been added meanwhile
+        const remaining = readLocal(PENDING_KEY, []).slice(pending.length);
+        writeLocal(PENDING_KEY, remaining);
+        for (const op of remaining) state = applyOp(state, op);
+        showState(state);
         setSyncStatus("saved");
-        setTimeout(() => setSyncStatus(null), 2000);
+        setTimeout(() => setSyncStatus(s => (s === "saved" ? null : s)), 2500);
       } catch (err) {
-        console.error("Load error:", err.message);
-        setSyncStatus("error");
+        console.error("Sync error:", err.message);
+        setSyncStatus("error"); // changes stay queued and are retried
       } finally {
         setSyncing(false);
       }
-    })();
+    });
+    return syncChain.current;
+  };
+
+  // Record a change: show it right away, queue it, then sync.
+  const mutate = (op) => {
+    // Queue a photo-free copy: the photo is already in Drive, and a few data URLs would fill localStorage and drop changes
+    const queued = op.receipt ? { ...op, receipt: stripReceiptPhoto(op.receipt) }
+      : op.log ? { ...op, log: stripReceiptPhoto(op.log) }
+      : op;
+    writeLocal(PENDING_KEY, [...readLocal(PENDING_KEY, []), queued]);
+    const next = applyOp(stateRef.current, op);
+    stateRef.current = next;
+    showState(next);
+    sync();
+  };
+
+  // Load: show the copy saved on this device instantly, then refresh from
+  // Google Sheets. Refresh again whenever the app is reopened or comes back online.
+  useEffect(() => {
+    let cached = { jobs: readLocal(STORAGE_KEY, []), logs: readLocal(STORAGE_KEY + "-logs", []) };
+    for (const op of readLocal(PENDING_KEY, [])) cached = applyOp(cached, op);
+    stateRef.current = cached;
+    setJobs(cached.jobs);
+    setLogs(cached.logs);
+    sync();
+
+    const onVisible = () => { if (document.visibilityState === "visible") sync(); };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("online", sync);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("online", sync);
+    };
   }, []);
 
-  // Save to Google Sheets + localStorage
-  const saveJobs = async (updated) => {
-    setJobs(updated);
-    // Strip photo blobs before saving to localStorage (too large)
-    const stripped = updated.map(j => ({
-      ...j,
-      receipts: (j.receipts||[]).map(r => ({ ...r, photo: null }))
-    }));
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(stripped)); } catch {}
-    setSyncing(true);
-    setSyncStatus(null);
-    try {
-      // Send the stripped copy — base64 photos blow past the Sheets cell limit; photoUrl (Drive) is the synced copy
-      const form = new FormData();
-      form.append("action", "saveJobs");
-      form.append("payload", JSON.stringify(stripped));
-      const res = await fetch(SHEETS_URL, { method: "POST", body: form });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const json = await res.json();
-      if (json && json.error) throw new Error(json.error);
-      setSyncStatus("saved");
-    } catch {
-      setSyncStatus("error");
-    } finally {
-      setSyncing(false);
-      setTimeout(() => setSyncStatus(null), 3000);
-    }
-  };
-
-  const saveLogs = async (updated) => {
-    setLogs(updated);
-    const strippedLogs = updated.map(l => ({ ...l, photo: null }));
-    try { localStorage.setItem(STORAGE_KEY + "-logs", JSON.stringify(strippedLogs)); } catch {}
-    setSyncing(true);
-    setSyncStatus(null);
-    try {
-      const form = new FormData();
-      form.append("action", "saveLogs");
-      form.append("payload", JSON.stringify(strippedLogs));
-      const resLogs = await fetch(SHEETS_URL, { method: "POST", body: form });
-      if (!resLogs.ok) throw new Error("HTTP " + resLogs.status);
-      const json = await resLogs.json();
-      if (json && json.error) throw new Error(json.error);
-      setSyncStatus("saved");
-    } catch {
-      setSyncStatus("error");
-    } finally {
-      setSyncing(false);
-      setTimeout(() => setSyncStatus(null), 3000);
-    }
-  };
-
-  const saveLog = (log) => {
-    const updated = logs.find(l => l.id === log.id)
-      ? logs.map(l => l.id === log.id ? log : l)
-      : [...logs, log];
-    saveLogs(updated);
-  };
+  const saveLog = (log) => mutate({ type: "upsertLog", log });
 
   const deleteLog = (id) => {
     if (!confirm("Delete this log entry?")) return;
-    saveLogs(logs.filter(l => l.id !== id));
+    mutate({ type: "deleteLog", id });
   };
 
-  const saveJob = (job) => {
-    const updated = jobs.find(j => j.id === job.id)
-      ? jobs.map(j => j.id === job.id ? { ...j, ...job } : j)
-      : [...jobs, job];
-    saveJobs(updated);
-  };
+  const saveJob = (job) => mutate({ type: "upsertJob", job });
 
   const deleteJob = (id) => {
     if (!confirm("Delete this job and all its receipts?")) return;
-    saveJobs(jobs.filter(j => j.id !== id));
+    mutate({ type: "deleteJob", id });
   };
 
-  const saveReceipt = (jobId, receipt) => {
-    saveJobs(jobs.map(j => {
-      if (j.id !== jobId) return j;
-      const receipts = j.receipts || [];
-      return {
-        ...j,
-        receipts: receipts.find(r => r.id === receipt.id)
-          ? receipts.map(r => r.id === receipt.id ? receipt : r)
-          : [...receipts, receipt]
-      };
-    }));
-  };
+  const saveReceipt = (jobId, receipt) => mutate({ type: "upsertReceipt", jobId, receipt });
 
-  const deleteReceipt = (jobId, receiptId) => {
-    saveJobs(jobs.map(j => j.id !== jobId ? j : {
-      ...j, receipts: (j.receipts || []).filter(r => r.id !== receiptId)
-    }));
-  };
+  const deleteReceipt = (jobId, receiptId) => mutate({ type: "deleteReceipt", jobId, id: receiptId });
 
   // Stats
   const allReceipts = jobs.flatMap(j => j.receipts || []);
@@ -557,7 +635,7 @@ export default function ContractorTracker() {
             }}>
               <div>
                 <div style={{ fontWeight: 700, fontSize: "14px" }}>⚠ Sync Offline</div>
-                <div style={{ fontSize: "12px", color: "#FCA5A5", marginTop: "2px" }}>Tap here to reconnect — your data is safe</div>
+                <div style={{ fontSize: "12px", color: "#FCA5A5", marginTop: "2px" }}>Your changes are kept on this device and will sync automatically when the connection is back. Tap to check the connection.</div>
               </div>
               <div style={{ fontSize: "20px" }}>→</div>
             </a>

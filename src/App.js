@@ -1,5 +1,8 @@
 import { useState, useEffect, useRef } from "react";
 
+const APP_VERSION = "1.2";
+const APP_VERSION_DATE = "Nov 1, 2026";
+const APP_BUILD = (process.env.REACT_APP_VERCEL_GIT_COMMIT_SHA || "").slice(0, 7);
 const STORAGE_KEY = "contractor-tracker-data";
 const SHEETS_URL = "https://script.google.com/macros/s/AKfycbxSRtuWnrhtCa9MtDdmoNp-yMjA4lijK5xHA-7tHNemHwn2YOFSKY2sIAXpTU14ytrJ/exec";
 
@@ -977,6 +980,10 @@ export default function ContractorTracker() {
               )}
             </>
           )}
+        </div>
+
+        <div style={{ textAlign: "center", fontSize: "11px", color: "#475569", fontFamily: "'DM Mono', monospace", padding: "8px 16px 24px" }}>
+          v{APP_VERSION} · {APP_VERSION_DATE}{APP_BUILD ? ` · ${APP_BUILD}` : ""}
         </div>
 
         {/* Modals */}

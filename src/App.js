@@ -243,6 +243,35 @@ async function postAction(action, payload) {
   return json;
 }
 
+// Which item a change touches, and whether it should exist once the change is saved.
+function opTarget(op) {
+  switch (op.type) {
+    case "upsertJob": return { key: "job:" + op.job.id, present: true };
+    case "deleteJob": return { key: "job:" + op.id, present: false };
+    case "upsertReceipt": return { key: "receipt:" + op.receipt.id, present: true, jobId: op.jobId };
+    case "deleteReceipt": return { key: "receipt:" + op.id, present: false, jobId: op.jobId };
+    case "upsertLog": return { key: "log:" + op.log.id, present: true };
+    case "deleteLog": return { key: "log:" + op.id, present: false };
+    default: return null;
+  }
+}
+
+// Changes from `ops` that Google Sheets didn't keep, judged against freshly loaded data.
+function missingChanges(server, ops) {
+  const expected = new Map();
+  for (const op of ops) { const t = opTarget(op); if (t) expected.set(t.key, t); }
+  const ids = new Set();
+  for (const j of server.jobs) {
+    ids.add("job:" + j.id);
+    for (const r of j.receipts || []) ids.add("receipt:" + r.id);
+  }
+  for (const l of server.logs || []) ids.add("log:" + l.id);
+  return [...expected.values()].filter(t =>
+    // a receipt under a job deleted in the same batch is gone either way
+    !(t.jobId && expected.get("job:" + t.jobId)?.present === false) &&
+    ids.has(t.key) !== t.present);
+}
+
 function applyOp(state, op) {
   let { jobs, logs } = state;
   switch (op.type) {
@@ -511,6 +540,7 @@ export default function ContractorTracker() {
 
   const [syncing, setSyncing] = useState(false);
   const [syncStatus, setSyncStatus] = useState(null);
+  const [syncError, setSyncError] = useState("");
 
   // Always-current copies of state for the async sync code
   const stateRef = useRef({ jobs: [], logs: [] });
@@ -540,6 +570,15 @@ export default function ContractorTracker() {
         if (pending.some(op => !op.type.endsWith("Log"))) await postAction("saveJobs", cleanJobs(state.jobs));
         if (hadDuplicateLogs || pending.some(op => op.type.endsWith("Log"))) await postAction("saveLogs", cleanLogs(state.logs));
 
+        // Confirm the Sheet really kept the changes before taking them off the queue
+        if (pending.length) {
+          const missing = missingChanges(await fetchServer(), pending);
+          if (missing.length) {
+            const names = [...new Set(missing.map(t => t.key.split(":")[0]))].join(", ");
+            throw new Error(`Google Sheets didn't keep ${missing.length} change${missing.length > 1 ? "s" : ""} (${names})`);
+          }
+        }
+
         // Only clear the changes we just saved; new ones may have been added meanwhile
         const remaining = readLocal(PENDING_KEY, []).slice(pending.length);
         writeLocal(PENDING_KEY, remaining);
@@ -549,6 +588,7 @@ export default function ContractorTracker() {
         setTimeout(() => setSyncStatus(s => (s === "saved" ? null : s)), 2500);
       } catch (err) {
         console.error("Sync error:", err.message);
+        setSyncError(err.message);
         setSyncStatus("error"); // changes stay queued and are retried
       } finally {
         setSyncing(false);
@@ -659,6 +699,7 @@ export default function ContractorTracker() {
               <div>
                 <div style={{ fontWeight: 700, fontSize: "14px" }}>⚠ Sync Offline</div>
                 <div style={{ fontSize: "12px", color: "#FCA5A5", marginTop: "2px" }}>Your changes are kept on this device and will sync automatically when the connection is back. Tap to check the connection.</div>
+                {syncError && <div style={{ fontSize: "11px", color: "#FECACA", marginTop: "4px", fontFamily: "'DM Mono', monospace" }}>{syncError}</div>}
               </div>
               <div style={{ fontSize: "20px" }}>→</div>
             </a>
